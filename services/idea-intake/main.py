@@ -8,6 +8,15 @@ import json, os, uuid, time
 
 app = FastAPI(title="Idea Intake Service", version="1.0.0")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ─── DATABASE WITH RETRY ──────────────────────────────
 DB_URL = (
     f"postgresql://{os.getenv('POSTGRES_USER','admin')}:"

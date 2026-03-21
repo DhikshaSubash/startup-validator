@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Startup Validator</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Segoe UI', sans-serif; background: #0f0f1a; color: #e0e0e0; min-height: 100vh; }
+    .navbar { background: #1a1a2e; padding: 16px 32px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #2a2a4a; }
+    .navbar h1 { color: #7c83fd; font-size: 20px; font-weight: 700; }
+    .navbar span { color: #888; font-size: 13px; }
+    .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
+    .card { background: #1a1a2e; border: 1px solid #2a2a4a; border-radius: 12px; padding: 28px; margin-bottom: 24px; }
+    .card h2 { font-size: 18px; color: #7c83fd; margin-bottom: 20px; }
+    .form-group { margin-bottom: 16px; }
+    .form-group label { display: block; font-size: 13px; color: #aaa; margin-bottom: 6px; }
+    .form-group input, .form-group textarea, .form-group select {
+      width: 100%; background: #0f0f1a; border: 1px solid #2a2a4a;
+      border-radius: 8px; padding: 10px 14px; color: #e0e0e0;
+      font-size: 14px; outline: none; transition: border 0.2s;
+    }
+    .form-group input:focus, .form-group textarea:focus, .form-group select:focus { border-color: #7c83fd; }
+    .form-group textarea { resize: vertical; min-height: 80px; }
+    .btn { background: #7c83fd; color: white; border: none; border-radius: 8px;
+           padding: 12px 28px; font-size: 15px; cursor: pointer; width: 100%;
+           transition: background 0.2s; font-weight: 600; }
+    .btn:hover { background: #5c63dd; }
+    .btn:disabled { background: #444; cursor: not-allowed; }
+    .score-big { text-align: center; padding: 20px; }
+    .score-number { font-size: 72px; font-weight: 800; line-height: 1; }
+    .verdict-badge { display: inline-block; padding: 6px 20px; border-radius: 20px;
+                     font-size: 16px; font-weight: 600; margin-top: 10px; }
+    .verdict-strong { background: #2d6a4f; color: #b7e4c7; }
+    .verdict-promising { background: #1d4e89; color: #a8d0f0; }
+    .verdict-needs { background: #7d4e00; color: #ffd580; }
+    .verdict-risk { background: #7b1d1d; color: #ffb3b3; }
+    .metrics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 16px; }
+    .metric-box { background: #0f0f1a; border: 1px solid #2a2a4a; border-radius: 8px; padding: 14px; }
+    .metric-box .label { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 1px; }
+    .metric-box .value { font-size: 22px; font-weight: 700; color: #7c83fd; margin-top: 4px; }
+    .metric-box .sub { font-size: 12px; color: #aaa; margin-top: 2px; }
+    .recommendation { background: #0f0f1a; border-left: 3px solid #7c83fd;
+                      border-radius: 0 8px 8px 0; padding: 14px 16px;
+                      font-size: 14px; color: #ccc; line-height: 1.6; margin-top: 16px; }
+    .status-bar { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+    .status-dot { width: 8px; height: 8px; border-radius: 50%; background: #2d6a4f; }
+    .status-dot.pending { background: #e07b00; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    .step-label { font-size: 12px; color: #888; }
+    .step-label.done { color: #2d6a4f; }
+    .step-label.active { color: #f0a500; }
+    .error { background: #3d1515; border: 1px solid #7b1d1d; border-radius: 8px;
+             padding: 12px 16px; color: #ffb3b3; font-size: 14px; margin-top: 12px; }
+    .download-btn { background: #2d6a4f; color: #b7e4c7; border: none; border-radius: 8px;
+                    padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 600;
+                    margin-top: 12px; transition: background 0.2s; }
+    .download-btn:hover { background: #1b4332; }
+    canvas { max-height: 200px; }
+  </style>
+</head>
+<body>
+  <div class="navbar">
+    <h1>Startup Validator</h1>
+    <span>AI-powered idea validation platform</span>
+  </div>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const INDUSTRIES = [
+      "technology","healthcare","edtech","fintech","food delivery",
+      "transportation","agriculture","retail","entertainment","real estate"
+    ];
+
+    function ScoreChart({ data }) {
+      const ref = useRef(null);
+      useEffect(() => {
+        if (!ref.current) return;
+        const ctx = ref.current.getContext("2d");
+        const chart = new Chart(ctx, {
+          type: "radar",
+          data: {
+            labels: ["Market Trend","Sentiment","Competition\nInverse","Problem\nUrgency"],
+            datasets: [{
+              label: "Validation Scores",
+              data: [
+                data.trend_score,
+                data.sentiment_score,
+                100 - data.saturation_score,
+                data.problem_urgency
+              ],
+              backgroundColor: "rgba(124,131,253,0.2)",
+              borderColor: "#7c83fd",
+              pointBackgroundColor: "#7c83fd",
+              borderWidth: 2
+            }]
+          },
+          options: {
+            scales: { r: { min: 0, max: 100, ticks: { color: "#888", stepSize: 25 }, grid: { color: "#2a2a4a" }, pointLabels: { color: "#ccc", font: { size: 11 } } } },
+            plugins: { legend: { display: false } }
+          }
+        });
+        return () => chart.destroy();
+      }, [data]);
+      return <canvas ref={ref}/>;
+    }
+
+    function App() {
+      const [form, setForm]         = useState({ email:"", title:"", description:"", industry:"technology" });
+      const [loading, setLoading]   = useState(false);
+      const [ideaId, setIdeaId]     = useState(null);
+      const [step, setStep]         = useState(0);
+      const [score, setScore]       = useState(null);
+      const [error, setError]       = useState(null);
+
+      const steps = ["Submitting idea","Analyzing market","Scanning competitors","NLP sentiment","Calculating score","Generating report"];
+
+      const submit = async () => {
+        if (!form.email || !form.title || !form.description) {
+          setError("Please fill in all fields."); return;
+        }
+        setError(null); setLoading(true); setScore(null); setStep(0);
+        try {
+          const res = await fetch("http://localhost:8001/ideas", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ user_email: form.email, title: form.title, description: form.description, industry: form.industry })
+          });
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || "Submission failed");
+          setIdeaId(data.idea_id);
+          setStep(1);
+          pollScore(data.idea_id, 1);
+        } catch(e) { setError(e.message); setLoading(false); }
+      };
+
+      const pollScore = async (id, currentStep) => {
+        const stepDelay = [0, 8000, 8000, 8000, 10000, 6000];
+        for (let s = currentStep; s < steps.length; s++) {
+          setStep(s);
+          await new Promise(r => setTimeout(r, stepDelay[s] || 6000));
+          if (s === steps.length - 1) {
+            try {
+              const res   = await fetch(`http://localhost:8005/score/${id}`);
+              const data  = await res.json();
+              if (res.ok) { setScore(data); setLoading(false); return; }
+            } catch(e) {}
+            setError("Score not ready yet — try refreshing in a few seconds.");
+            setLoading(false);
+          }
+        }
+      };
+
+      const verdictClass = (v) => {
+        if (v === "Strong Go")  return "verdict-strong";
+        if (v === "Promising")  return "verdict-promising";
+        if (v === "Needs Work") return "verdict-needs";
+        return "verdict-risk";
+      };
+
+      const scoreColor = (s) => s >= 75 ? "#2d6a4f" : s >= 55 ? "#1d6fa4" : s >= 35 ? "#e07b00" : "#c0392b";
+
+      return (
+        <div className="container">
+          <div className="card">
+            <h2>Validate Your Startup Idea</h2>
+            <div className="form-group">
+              <label>Your Email</label>
+              <input placeholder="you@example.com" value={form.email}
+                onChange={e => setForm({...form, email: e.target.value})}/>
+            </div>
+            <div className="form-group">
+              <label>Startup Idea Title</label>
+              <input placeholder="e.g. AI tutor app for students" value={form.title}
+                onChange={e => setForm({...form, title: e.target.value})}/>
+            </div>
+            <div className="form-group">
+              <label>Description</label>
+              <textarea placeholder="Describe your idea in 2-3 sentences..."
+                value={form.description}
+                onChange={e => setForm({...form, description: e.target.value})}/>
+            </div>
+            <div className="form-group">
+              <label>Industry</label>
+              <select value={form.industry} onChange={e => setForm({...form, industry: e.target.value})}>
+                {INDUSTRIES.map(i => <option key={i} value={i}>{i.charAt(0).toUpperCase()+i.slice(1)}</option>)}
+              </select>
+            </div>
+            {error && <div className="error">{error}</div>}
+            <button className="btn" onClick={submit} disabled={loading}>
+              {loading ? "Validating..." : "Validate My Idea"}
+            </button>
+          </div>
+
+          {loading && (
+            <div className="card">
+              <h2>Validation in Progress</h2>
+              <div className="status-bar">
+                {steps.map((s, i) => (
+                  <span key={i} className={`step-label ${i < step ? "done" : i === step ? "active" : ""}`}>
+                    {i < step ? "✓" : i === step ? "⟳" : "○"} {s}
+                    {i < steps.length - 1 && <span style={{color:"#333", margin:"0 6px"}}>→</span>}
+                  </span>
+                ))}
+              </div>
+              <div style={{color:"#888", fontSize:"13px"}}>
+                Processing... this takes about 40 seconds
+              </div>
+            </div>
+          )}
+
+          {score && (
+            <div className="card">
+              <h2>Validation Results</h2>
+              <div className="score-big">
+                <div className="score-number" style={{color: scoreColor(score.final_score)}}>
+                  {score.final_score}
+                </div>
+                <div style={{color:"#888", fontSize:"13px", marginTop:"4px"}}>Validation Score</div>
+                <div className={`verdict-badge ${verdictClass(score.verdict)}`}>
+                  {score.verdict}
+                </div>
+              </div>
+
+              <ScoreChart data={score}/>
+
+              <div className="metrics-grid">
+                <div className="metric-box">
+                  <div className="label">Market Trend</div>
+                  <div className="value">{score.trend_score}/100</div>
+                  <div className="sub">{score.trend_direction}</div>
+                </div>
+                <div className="metric-box">
+                  <div className="label">Public Sentiment</div>
+                  <div className="value">{score.sentiment_score}/100</div>
+                  <div className="sub">{score.sentiment_label}</div>
+                </div>
+                <div className="metric-box">
+                  <div className="label">Competition Level</div>
+                  <div className="value">{score.saturation_score}/100</div>
+                  <div className="sub">{score.saturation_level} saturation</div>
+                </div>
+                <div className="metric-box">
+                  <div className="label">Problem Urgency</div>
+                  <div className="value">{score.problem_urgency}/100</div>
+                  <div className="sub">{score.problem_urgency > 70 ? "High demand" : "Moderate demand"}</div>
+                </div>
+              </div>
+
+              <div className="recommendation">
+                <strong style={{color:"#7c83fd"}}>Recommendation: </strong>
+                {score.recommendation}
+              </div>
+
+              <button className="download-btn"
+                onClick={() => window.open(`http://localhost:8006/report/${score.idea_id}`, "_blank")}>
+                Download PDF Report
+              </button>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+  </script>
+</body>
+</html>

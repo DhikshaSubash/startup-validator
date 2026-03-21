@@ -8,6 +8,15 @@ import json, os, time, threading, uuid
 
 app = FastAPI(title="Scoring Engine", version="1.0.0")
 
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ─── POSTGRESQL ───────────────────────────────────────
 DB_URL = (
     f"postgresql://{os.getenv('POSTGRES_USER','admin')}:"
