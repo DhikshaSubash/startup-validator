@@ -4,17 +4,30 @@ from sqlalchemy import create_engine, Column, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from kafka import KafkaProducer
 from datetime import datetime
-import json, os, uuid
+import json, os, uuid, time
 
 app = FastAPI(title="Idea Intake Service", version="1.0.0")
 
-# ─── DATABASE ─────────────────────────────────────────
+# ─── DATABASE WITH RETRY ──────────────────────────────
 DB_URL = (
     f"postgresql://{os.getenv('POSTGRES_USER','admin')}:"
     f"{os.getenv('POSTGRES_PASSWORD','secret123')}@"
     f"postgres:5432/{os.getenv('POSTGRES_DB','startup_validator')}"
 )
-engine = create_engine(DB_URL)
+
+def create_engine_with_retry(url, retries=10, delay=3):
+    for attempt in range(retries):
+        try:
+            engine = create_engine(url)
+            engine.connect()
+            print("Connected to PostgreSQL successfully")
+            return engine
+        except Exception as e:
+            print(f"Attempt {attempt+1}/{retries} - DB not ready: {e}")
+            time.sleep(delay)
+    raise Exception("Could not connect to PostgreSQL after retries")
+
+engine = create_engine_with_retry(DB_URL)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -65,7 +78,6 @@ def submit_idea(idea: IdeaInput):
         db.commit()
         db.refresh(new_idea)
 
-        # Publish event to Kafka
         producer = get_producer()
         if producer:
             producer.send("idea-submitted", {
