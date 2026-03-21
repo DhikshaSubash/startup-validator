@@ -6,6 +6,8 @@ from passlib.context import CryptContext
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 import os
+import warnings
+warnings.filterwarnings("ignore", ".*error reading bcrypt version.*")
 
 app = FastAPI(title="Startup Validator - API Gateway", version="1.0.0")
 
@@ -22,7 +24,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "fallback-secret")
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
 security = HTTPBearer()
 
 # ─── MODELS ───────────────────────────────────────────
