@@ -5,13 +5,12 @@ from jose import jwt, JWTError
 from passlib.context import CryptContext
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-import os
-import warnings
+import os, json, warnings
+
 warnings.filterwarnings("ignore", ".*error reading bcrypt version.*")
 
 app = FastAPI(title="Startup Validator - API Gateway", version="1.0.0")
 
-# ─── CORS ─────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,13 +18,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── CONFIG ───────────────────────────────────────────
-SECRET_KEY = os.getenv("SECRET_KEY", "fallback-secret")
-ALGORITHM = "HS256"
+SECRET_KEY           = os.getenv("SECRET_KEY", "supersecretkey123")
+ALGORITHM            = "HS256"
 TOKEN_EXPIRE_MINUTES = 60 * 24
+USERS_FILE           = "/app/users.json"
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
-security = HTTPBearer()
+security    = HTTPBearer()
+
+# ─── FILE-BASED USER STORE ────────────────────────────
+# Persists across restarts — stored in /app/users.json
+def load_users():
+    try:
+        with open(USERS_FILE, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_users(users):
+    try:
+        with open(USERS_FILE, "w") as f:
+            json.dump(users, f)
+    except Exception as e:
+        print(f"Error saving users: {e}")
 
 # ─── MODELS ───────────────────────────────────────────
 class UserRegister(BaseModel):
@@ -37,17 +52,7 @@ class UserLogin(BaseModel):
     email: str
     password: str
 
-# ─── TEMP USER STORE ──────────────────────────────────
-# We replace this with real PostgreSQL in the next step
-fake_users = {}
-
 # ─── HELPERS ──────────────────────────────────────────
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
-
-def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
-
 def create_token(data: dict) -> str:
     payload = data.copy()
     payload["exp"] = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MINUTES)
@@ -76,24 +81,39 @@ def health():
 
 @app.post("/auth/register")
 def register(user: UserRegister):
-    if user.email in fake_users:
+    users = load_users()
+    if user.email in users:
         raise HTTPException(status_code=400, detail="Email already registered")
-    fake_users[user.email] = {
-        "name": user.name,
-        "email": user.email,
-        "password": hash_password(user.password)
+    users[user.email] = {
+        "name":     user.name,
+        "email":    user.email,
+        "password": pwd_context.hash(user.password)
     }
-    token = create_token({"sub": user.email})
-    return {"token": token, "message": "Registered successfully"}
+    save_users(users)
+    token = create_token({"sub": user.email, "name": user.name})
+    return {
+        "token":   token,
+        "name":    user.name,
+        "email":   user.email,
+        "message": "Registered successfully"
+    }
 
 @app.post("/auth/login")
 def login(user: UserLogin):
-    stored = fake_users.get(user.email)
-    if not stored or not verify_password(user.password, stored["password"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    token = create_token({"sub": user.email})
-    return {"token": token, "message": "Login successful"}
+    users  = load_users()
+    stored = users.get(user.email)
+    if not stored or not pwd_context.verify(user.password, stored["password"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = create_token({"sub": user.email, "name": stored["name"]})
+    return {
+        "token":   token,
+        "name":    stored["name"],
+        "email":   user.email,
+        "message": "Login successful"
+    }
 
 @app.get("/auth/me")
 def me(current_user: str = Depends(get_current_user)):
-    return {"email": current_user}
+    users = load_users()
+    user  = users.get(current_user, {})
+    return {"email": current_user, "name": user.get("name", "")}

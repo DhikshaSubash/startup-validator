@@ -1,14 +1,14 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, String, Text, DateTime
 from sqlalchemy.orm import declarative_base, sessionmaker
 from kafka import KafkaProducer
+from pymongo import MongoClient
 from datetime import datetime
 import json, os, uuid, time
 
 app = FastAPI(title="Idea Intake Service", version="1.0.0")
-
-from fastapi.middleware.cors import CORSMiddleware
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,16 +29,16 @@ def create_engine_with_retry(url, retries=10, delay=3):
         try:
             engine = create_engine(url)
             engine.connect()
-            print("Connected to PostgreSQL successfully")
+            print("Idea Intake: PostgreSQL connected")
             return engine
         except Exception as e:
-            print(f"Attempt {attempt+1}/{retries} - DB not ready: {e}")
+            print(f"DB attempt {attempt+1}/{retries}: {e}")
             time.sleep(delay)
-    raise Exception("Could not connect to PostgreSQL after retries")
+    raise Exception("Could not connect to PostgreSQL")
 
-engine = create_engine_with_retry(DB_URL)
+engine       = create_engine_with_retry(DB_URL)
 SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
+Base         = declarative_base()
 
 class IdeaModel(Base):
     __tablename__ = "ideas"
@@ -51,22 +51,30 @@ class IdeaModel(Base):
 
 Base.metadata.create_all(engine)
 
+# ─── MONGODB ──────────────────────────────────────────
+def get_mongo():
+    client = MongoClient(os.getenv("MONGO_URI", "mongodb://mongo:27017/startup_validator"))
+    return client.startup_validator
+
 # ─── KAFKA PRODUCER ───────────────────────────────────
 def get_producer():
-    try:
-        return KafkaProducer(
-            bootstrap_servers=os.getenv("KAFKA_BROKER", "kafka:9092"),
-            value_serializer=lambda v: json.dumps(v).encode("utf-8")
-        )
-    except Exception:
-        return None
+    for i in range(10):
+        try:
+            return KafkaProducer(
+                bootstrap_servers=os.getenv("KAFKA_BROKER", "kafka:9092"),
+                value_serializer=lambda v: json.dumps(v).encode("utf-8")
+            )
+        except Exception as e:
+            print(f"Kafka attempt {i+1}/10: {e}")
+            time.sleep(3)
+    return None
 
 # ─── MODELS ───────────────────────────────────────────
 class IdeaInput(BaseModel):
-    user_email: str
-    title: str
+    user_email:  str
+    title:       str
     description: str
-    industry: str
+    industry:    str
 
 # ─── ROUTES ───────────────────────────────────────────
 @app.get("/health")
@@ -78,22 +86,38 @@ def submit_idea(idea: IdeaInput):
     db = SessionLocal()
     try:
         new_idea = IdeaModel(
-            user_email=idea.user_email,
-            title=idea.title,
-            description=idea.description,
-            industry=idea.industry
+            user_email  = idea.user_email,
+            title       = idea.title,
+            description = idea.description,
+            industry    = idea.industry
         )
         db.add(new_idea)
         db.commit()
         db.refresh(new_idea)
 
+        # Save to MongoDB for AI enrichment in scoring engine
+        mongo = get_mongo()
+        mongo.ideas_meta.update_one(
+            {"idea_id": new_idea.id},
+            {"$set": {
+                "idea_id":     new_idea.id,
+                "title":       new_idea.title,
+                "description": new_idea.description,
+                "industry":    new_idea.industry,
+                "user_email":  new_idea.user_email
+            }},
+            upsert=True
+        )
+
+        # Publish to Kafka
         producer = get_producer()
         if producer:
             producer.send("idea-submitted", {
-                "idea_id": new_idea.id,
-                "title": new_idea.title,
+                "idea_id":     new_idea.id,
+                "title":       new_idea.title,
                 "description": new_idea.description,
-                "industry": new_idea.industry
+                "industry":    new_idea.industry,
+                "user_email":  new_idea.user_email
             })
             producer.flush()
 
@@ -115,11 +139,32 @@ def get_idea(idea_id: str):
         if not idea:
             raise HTTPException(status_code=404, detail="Idea not found")
         return {
-            "id": idea.id,
-            "title": idea.title,
+            "id":          idea.id,
+            "title":       idea.title,
             "description": idea.description,
-            "industry": idea.industry,
-            "created_at": idea.created_at
+            "industry":    idea.industry,
+            "user_email":  idea.user_email,
+            "created_at":  idea.created_at
         }
+    finally:
+        db.close()
+
+@app.get("/ideas/user/{user_email}")
+def get_ideas_by_user(user_email: str):
+    db = SessionLocal()
+    try:
+        ideas = db.query(IdeaModel).filter(
+            IdeaModel.user_email == user_email
+        ).order_by(IdeaModel.created_at.desc()).all()
+        return [
+            {
+                "id":          i.id,
+                "title":       i.title,
+                "description": i.description,
+                "industry":    i.industry,
+                "created_at":  i.created_at
+            }
+            for i in ideas
+        ]
     finally:
         db.close()
