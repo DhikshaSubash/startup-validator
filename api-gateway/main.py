@@ -28,16 +28,35 @@ security    = HTTPBearer()
 
 # ─── FILE-BASED USER STORE ────────────────────────────
 # Persists across restarts — stored in /app/users.json
+def _resolved_users_file() -> str:
+    """
+    Handle both correct file path and accidental directory path mounts.
+    If USERS_FILE is a directory, store data in USERS_FILE/users.json.
+    """
+    path = USERS_FILE
+    if os.path.isdir(path):
+        path = os.path.join(path, "users.json")
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return path
+
 def load_users():
+    path = _resolved_users_file()
     try:
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
-    except:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"Error loading users: {e}")
         return {}
 
 def save_users(users):
+    path = _resolved_users_file()
     try:
-        with open(USERS_FILE, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(users, f)
     except Exception as e:
         print(f"Error saving users: {e}")
@@ -81,34 +100,36 @@ def health():
 
 @app.post("/auth/register")
 def register(user: UserRegister):
+    email = user.email.strip().lower()
     users = load_users()
-    if user.email in users:
+    if email in users:
         raise HTTPException(status_code=400, detail="Email already registered")
-    users[user.email] = {
+    users[email] = {
         "name":     user.name,
-        "email":    user.email,
+        "email":    email,
         "password": pwd_context.hash(user.password)
     }
     save_users(users)
-    token = create_token({"sub": user.email, "name": user.name})
+    token = create_token({"sub": email, "name": user.name})
     return {
         "token":   token,
         "name":    user.name,
-        "email":   user.email,
+        "email":   email,
         "message": "Registered successfully"
     }
 
 @app.post("/auth/login")
 def login(user: UserLogin):
+    email  = user.email.strip().lower()
     users  = load_users()
-    stored = users.get(user.email)
+    stored = users.get(email)
     if not stored or not pwd_context.verify(user.password, stored["password"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_token({"sub": user.email, "name": stored["name"]})
+    token = create_token({"sub": email, "name": stored["name"]})
     return {
         "token":   token,
         "name":    stored["name"],
-        "email":   user.email,
+        "email":   email,
         "message": "Login successful"
     }
 
