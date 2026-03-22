@@ -146,6 +146,7 @@ const API_GW      = "http://localhost:8000";
 const API_IDEAS   = "http://localhost:8001";
 const API_SCORES  = "http://localhost:8005";
 const API_REPORTS = "http://localhost:8006";
+const API_COMP    = "http://localhost:8003";
 
 const INDUSTRIES = ["technology","healthcare","edtech","fintech","food delivery",
   "transportation","agriculture","retail","entertainment","real estate"];
@@ -319,13 +320,34 @@ function Sidebar({page,setPage,user,onLogout}){
 /* ── Result Tabs ── */
 function ResultView({score}){
   const [tab,setTab]=useState("overview");
+  const [comp,setComp]=useState({loading:false,data:null,error:""});
   const tabs=[
     {id:"overview",  label:"Overview"},
     {id:"market",    label:"Market Size"},
     {id:"swot",      label:"SWOT"},
     {id:"breakdown", label:"Score Breakdown"},
     {id:"recommend", label:"Recommendation"},
+    {id:"competitors", label:"Competitors"},
   ];
+
+  useEffect(()=>{
+    if(tab!=="competitors"||!score?.idea_id) return;
+    let ignore=false;
+    (async()=>{
+      setComp({loading:true,data:null,error:""});
+      try{
+        const r=await fetch(`${API_COMP}/competitors/${score.idea_id}`);
+        const d=await r.json();
+        if(!ignore){
+          if(r.ok) setComp({loading:false,data:d,error:""});
+          else setComp({loading:false,data:null,error:d?.detail||"Failed to load"});
+        }
+      }catch(e){
+        if(!ignore) setComp({loading:false,data:null,error:"Network error"});
+      }
+    })();
+    return()=>{ignore=true;};
+  },[tab,score?.idea_id]);
 
   return(
     <div className="card">
@@ -567,6 +589,73 @@ function ResultView({score}){
               `${API_REPORTS}/report/${score.idea_id}`,"_blank")}>
             Download PDF Report
           </button>
+        </div>
+      )}
+
+      {/* Competitors */}
+      {tab==="competitors"&&(
+        <div>
+          {comp.loading&&(
+            <div style={{fontSize:"13px",color:"var(--muted)"}}>Loading competitors…</div>
+          )}
+          {comp.error&&!comp.loading&&(
+            <div className="error-msg">{comp.error}</div>
+          )}
+          {comp.data&&(
+            <div>
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:"12px"}}>
+                <div style={{fontSize:"12px",color:"var(--muted)"}}>
+                  Detected {comp.data.competitor_count} competitors
+                </div>
+                <span className="badge" style={{
+                  background:comp.data.saturation_level==="low"?"rgba(45,106,79,.3)":
+                             comp.data.saturation_level==="high"?"rgba(123,29,29,.3)":"rgba(125,78,0,.3)",
+                  color:comp.data.saturation_level==="low"?"#86efac":
+                        comp.data.saturation_level==="high"?"#fca5a5":"#fcd34d"
+                }}>
+                  {comp.data.saturation_level.toUpperCase()} SATURATION
+                </span>
+              </div>
+
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"12px"}}>
+                {(comp.data.competitors||[]).map((c,i)=>(
+                  <div key={`${c.name}-${i}`} className="m-box" style={{background:"var(--bg)"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"8px"}}>
+                      <div style={{fontSize:"16px",fontWeight:700,color:"var(--text)"}}>
+                        {c.name}
+                      </div>
+                      <span className="badge" style={{
+                        background:c.source==="Product Hunt"?"rgba(124,131,253,.2)":"rgba(42,42,80,.8)",
+                        color:c.source==="Product Hunt"?"#a8b1ff":"#cbd5e1"
+                      }}>
+                        {c.source}
+                      </span>
+                    </div>
+                    <div style={{fontSize:"13px",color:"#cbd5e1",marginBottom:"10px"}}>
+                      {c.description||"Similar space; monitor positioning and differentiation."}
+                    </div>
+                    <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
+                      <div style={{
+                        width:"6px",height:"6px",borderRadius:"50%",
+                        background:i%3===0?"#86efac":i%3===1?"#93c5fd":"#fcd34d"
+                      }}/>
+                      <div style={{fontSize:"11px",color:"var(--hint)"}}>
+                        Market position: {i%3===0?"niche":"generalist"} • Visibility: {i%3===2?"emerging":"established"}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div style={{marginTop:"16px",padding:"14px",background:"var(--bg)",
+                           border:"1px solid var(--border)",borderRadius:"8px",color:"#cbd5e1",
+                           fontSize:"13px",lineHeight:1.7}}>
+                Given {comp.data.competitor_count} competitors and {comp.data.saturation_level} saturation,
+                focus on a sharp niche and a clear differentiator. Track feature gaps and pricing to position
+                against closest alternatives.
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

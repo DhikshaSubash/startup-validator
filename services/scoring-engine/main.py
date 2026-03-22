@@ -227,7 +227,8 @@ def enrich_with_ai(idea_title: str, idea_description: str,
         import google.generativeai as genai
 
         genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        model = genai.GenerativeModel(model_name)
 
         prompt = f"""You are a startup advisor analyzing a business idea. Based on the data provided, give a detailed analysis.
 
@@ -256,9 +257,39 @@ Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanati
 }}"""
 
         response = model.generate_content(prompt)
-        text     = response.text.strip()
+        text     = (getattr(response, "text", "") or "").strip()
         text     = text.replace("```json", "").replace("```", "").strip()
-        result   = json.loads(text)
+        # Try direct JSON parse; if it fails, attempt to extract JSON object
+        try:
+            result = json.loads(text)
+        except Exception:
+            import re
+            match = re.search(r"\{[\s\S]*\}", text)
+            if not match:
+                raise ValueError("No JSON object found in model response")
+            candidate = match.group(0)
+            result = json.loads(candidate)
+
+        # Normalize schema to ensure correct types
+        def ensure_list(x):
+            if isinstance(x, list):
+                return [str(i).strip() for i in x if str(i).strip()]
+            if x is None:
+                return []
+            return [str(x).strip()]
+
+        result = {
+            "summary":        str(result.get("summary", "")).strip(),
+            "strengths":      ensure_list(result.get("strengths")),
+            "weaknesses":     ensure_list(result.get("weaknesses")),
+            "opportunities":  ensure_list(result.get("opportunities")),
+            "threats":        ensure_list(result.get("threats")),
+            "recommendation": str(result.get("recommendation", "")).strip(),
+            "risk_level":     str(result.get("risk_level", "Medium")).strip().title(),
+            "risk_reason":    str(result.get("risk_reason", "")).strip(),
+        }
+        if result["risk_level"] not in ["Low", "Medium", "High"]:
+            result["risk_level"] = "Medium"
         print(f"Gemini AI enrichment successful for: {idea_title}")
         return result
 

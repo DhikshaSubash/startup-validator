@@ -1,10 +1,19 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from kafka import KafkaConsumer, KafkaProducer
 from bs4 import BeautifulSoup
 import requests, json, os, time, threading
 
 app = FastAPI(title="Competitor Scan Service", version="1.0.0")
+
+# ─── CORS ───────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ─── MONGODB ──────────────────────────────────────────
 def get_db():
@@ -80,6 +89,65 @@ def search_competitors(title: str, industry: str) -> dict:
         "saturation_level": saturation_level
     }
 
+# ─── OPTIONAL: AI DESCRIPTIONS ─────────────────────────
+def describe_competitors_with_ai(idea_title: str, competitors: list) -> list:
+    """
+    Returns a list of competitors with an added 'description' key using Gemini if available.
+    Gracefully falls back to a simple heuristic when AI is unavailable.
+    """
+    if not competitors:
+        return competitors
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        # Fallback heuristic
+        return [
+            {**c, "description": f"{c['name']} appears to be a product in a similar space to {idea_title}."}
+            for c in competitors
+        ]
+
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        model = genai.GenerativeModel(model_name)
+
+        names = [c.get("name", "") for c in competitors]
+        names_str = "\n".join(f"- {n}" for n in names if n)
+        prompt = f"""You are a concise market analyst. For each competitor name below, write a single, crisp, plain-English one-liner describing what the product likely does and its market position. Keep each to <= 18 words, no marketing fluff.
+
+Idea: {idea_title}
+Competitors:
+{names_str}
+
+Respond ONLY as raw JSON array of strings, same order as input competitors. No markdown, no keys.
+"""
+        resp = model.generate_content(prompt)
+        text = (getattr(resp, "text", "") or "").strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        try:
+            lines = json.loads(text)
+            if not isinstance(lines, list):
+                raise ValueError("Not a list")
+        except Exception:
+            # Fallback split by lines
+            lines = [ln.strip("- ").strip() for ln in text.splitlines() if ln.strip()]
+
+        result = []
+        for i, c in enumerate(competitors):
+            desc = (lines[i] if i < len(lines) and lines[i] else "").strip()
+            if not desc:
+                desc = f"{c.get('name','A competitor')} targets a similar problem with a comparable solution."
+            result.append({**c, "description": desc})
+        return result
+
+    except Exception as e:
+        print(f"AI competitor description failed: {e}")
+        return [
+            {**c, "description": f"{c['name']} targets similar users; monitor positioning and differentiation."}
+            for c in competitors
+        ]
+
 # ─── KAFKA CONSUMER THREAD ────────────────────────────
 def consume_ideas():
     for i in range(15):
@@ -149,6 +217,12 @@ def get_competitors(idea_id: str):
     if not data:
         raise HTTPException(status_code=404, detail="Competitor data not found yet")
     data.pop("_id", None)
+    # Enrich with AI one-liners if not already present
+    comp_list = data.get("competitors", [])
+    if comp_list and (not comp_list or "description" not in comp_list[0]):
+        title_doc = db.ideas_meta.find_one({"idea_id": idea_id}) or {}
+        title = title_doc.get("title", "the idea")
+        data["competitors"] = describe_competitors_with_ai(title, comp_list)
     return data
 
 @app.post("/competitors/scan")
