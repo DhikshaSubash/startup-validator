@@ -16,6 +16,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── Debug logging (runtime evidence) ─────────────────────────────
+# This writes NDJSON to the host log file when possible, and also attempts
+# to POST to the configured ingest endpoint as a fallback.
+LOG_PATH = r"D:\sem6\Cloud\startup-validator\.cursor\debug.log"
+SERVER_ENDPOINT = "http://127.0.0.1:7242/ingest/adbd55fd-6429-4401-b3a0-ecbf67797a6d"
+RUN_ID = "debug-pre"
+
+def _debug_log(hypothesisId: str, location: str, message: str, data: dict | None = None) -> None:
+    payload = {
+        "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}",
+        "timestamp": int(time.time() * 1000),
+        "runId": RUN_ID,
+        "hypothesisId": hypothesisId,
+        "location": location,
+        "message": message,
+        "data": data or {},
+    }
+    line = json.dumps(payload, ensure_ascii=True)
+
+    # Try host file first (works when service runs on host with repo mounted).
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+    # Fallback: try the ingest server endpoint.
+    try:
+        httpx.post(SERVER_ENDPOINT, json=payload, timeout=2)
+    except Exception:
+        pass
+
+    # Last resort: show in container logs.
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass
+
 # ─── POSTGRESQL ───────────────────────────────────────
 DB_URL = (
     f"postgresql://{os.getenv('POSTGRES_USER','admin')}:"
@@ -224,10 +262,26 @@ def calculate_score(trend: dict, sentiment: dict, competitor: dict) -> dict:
 def enrich_with_ai(idea_title: str, idea_description: str,
                    industry: str, score_data: dict) -> dict:
     try:
+        api_key = os.getenv("GEMINI_API_KEY")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        # #region agent log
+        _debug_log(
+            hypothesisId="H1",
+            location="services/scoring-engine/main.py:enrich_with_ai:start",
+            message="enrich_with_ai start",
+            data={
+                "api_key_set": bool(api_key),
+                "model_name": model_name,
+                # Avoid logging user content; only log sizes.
+                "idea_title_len": len(idea_title or ""),
+                "idea_description_len": len(idea_description or ""),
+            },
+        )
+        # #endregion
+
         import google.generativeai as genai
 
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        genai.configure(api_key=api_key)
         model = genai.GenerativeModel(model_name)
 
         prompt = f"""You are a startup advisor analyzing a business idea. Based on the data provided, give a detailed analysis.
@@ -256,9 +310,35 @@ Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanati
   "risk_reason": "One sentence explaining the single biggest risk for this specific idea"
 }}"""
 
+        # #region agent log
+        _debug_log(
+            hypothesisId="H3",
+            location="services/scoring-engine/main.py:enrich_with_ai:before_generate",
+            message="about to call Gemini",
+            data={
+                "prompt_chars": len(prompt or ""),
+                "final_score": score_data.get("final_score"),
+                "verdict": score_data.get("verdict"),
+            },
+        )
+        # #endregion
+
         response = model.generate_content(prompt)
         text     = (getattr(response, "text", "") or "").strip()
         text     = text.replace("```json", "").replace("```", "").strip()
+
+        # #region agent log
+        _debug_log(
+            hypothesisId="H4",
+            location="services/scoring-engine/main.py:enrich_with_ai:after_generate",
+            message="Gemini response received",
+            data={
+                "response_text_len": len(text or ""),
+                "looks_like_json": "{" in (text or ""),
+            },
+        )
+        # #endregion
+
         # Try direct JSON parse; if it fails, attempt to extract JSON object
         try:
             result = json.loads(text)
@@ -291,10 +371,38 @@ Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanati
         if result["risk_level"] not in ["Low", "Medium", "High"]:
             result["risk_level"] = "Medium"
         print(f"Gemini AI enrichment successful for: {idea_title}")
+
+        # #region agent log
+        _debug_log(
+            hypothesisId="H4",
+            location="services/scoring-engine/main.py:enrich_with_ai:parsed_ok",
+            message="Gemini JSON parsed successfully",
+            data={
+                "risk_level": result.get("risk_level"),
+                "strengths_count": len(result.get("strengths") or []),
+                "weaknesses_count": len(result.get("weaknesses") or []),
+                "recommendation_len": len(str(result.get("recommendation") or "")),
+            },
+        )
+        # #endregion
+
         return result
 
     except Exception as e:
         print(f"Gemini AI enrichment failed: {e}")
+
+        # #region agent log
+        _debug_log(
+            hypothesisId="H2_H5",
+            location="services/scoring-engine/main.py:enrich_with_ai:error",
+            message="Gemini AI enrichment failed",
+            data={
+                "error_type": type(e).__name__,
+                "error_message": str(e)[:300],
+            },
+        )
+        # #endregion
+
         return None
 
 # ─── WAIT AND SCORE ───────────────────────────────────
@@ -317,6 +425,20 @@ def wait_and_score(idea_id: str, db, producer, retries=12, delay=5):
 
             # AI enrichment
             ai_data = enrich_with_ai(idea_title, idea_description, industry, scored)
+
+            # #region agent log
+            _debug_log(
+                hypothesisId="H5",
+                location="services/scoring-engine/main.py:wait_and_score:ai_outcome",
+                message="AI enrichment outcome",
+                data={
+                    "ai_data_present": bool(ai_data),
+                    "ai_summary_len": len(ai_data.get("summary") or "") if ai_data else 0,
+                    "ai_recommendation_len": len(ai_data.get("recommendation") or "") if ai_data else 0,
+                },
+            )
+            # #endregion
+
             if ai_data:
                 scored["ai_summary"]              = ai_data.get("summary", "")
                 scored["ai_swot_strengths"]       = json.dumps(ai_data.get("strengths", []))
@@ -410,6 +532,15 @@ def consume_ideas():
 
 @app.on_event("startup")
 def startup_event():
+    # #region agent log
+    print("H0 reached startup_event", flush=True)
+    _debug_log(
+        hypothesisId="H0",
+        location="services/scoring-engine/main.py:startup_event",
+        message="scoring-engine started",
+        data={"gemini_api_key_set": bool(os.getenv("GEMINI_API_KEY"))},
+    )
+    # #endregion
     t = threading.Thread(target=consume_ideas, daemon=True)
     t.start()
 
@@ -425,6 +556,31 @@ def get_score(idea_id: str):
         score = session.query(ScoreModel).filter_by(idea_id=idea_id).first()
         if not score:
             raise HTTPException(status_code=404, detail="Score not ready yet")
+
+        # #region agent log
+        try:
+            ai_swot_strengths = json.loads(score.ai_swot_strengths or "[]")
+            ai_swot_weaknesses = json.loads(score.ai_swot_weaknesses or "[]")
+            ai_swot_opportunities = json.loads(score.ai_swot_opportunities or "[]")
+            ai_swot_threats = json.loads(score.ai_swot_threats or "[]")
+        except Exception as _e:
+            ai_swot_strengths = ai_swot_weaknesses = ai_swot_opportunities = ai_swot_threats = []
+
+        _debug_log(
+            hypothesisId="H6",
+            location="services/scoring-engine/main.py:get_score:return_check",
+            message="/score returning AI fields (lengths only)",
+            data={
+                "ai_summary_len": len(score.ai_summary or ""),
+                "ai_recommendation_len": len(score.ai_recommendation or ""),
+                "ai_swot_strengths_len": len(ai_swot_strengths or []),
+                "ai_swot_weaknesses_len": len(ai_swot_weaknesses or []),
+                "ai_swot_opportunities_len": len(ai_swot_opportunities or []),
+                "ai_swot_threats_len": len(ai_swot_threats or []),
+            },
+        )
+        # #endregion
+
         return {
             "idea_id":              score.idea_id,
             "idea_title":           score.idea_title,
