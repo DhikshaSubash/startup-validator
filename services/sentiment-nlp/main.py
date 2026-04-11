@@ -4,6 +4,28 @@ from kafka import KafkaConsumer, KafkaProducer
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 import requests, json, os, time, threading
 
+import logging
+from datetime import datetime
+def log_event(service: str, event: str, message: str,
+              idea_id: str = None, level: str = "INFO",
+              metadata: dict = None):
+    entry = {
+        "idea_id":   idea_id,
+        "service":   service,
+        "level":     level,
+        "event":     event,
+        "message":   message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata":  metadata or {}
+    }
+    try:
+        client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://mongo:27017/startup_validator"))
+        client.startup_validator.validation_logs.insert_one(entry)
+    except Exception as e:
+        print(f"Log write failed: {e}")
+    print(json.dumps({k: v for k, v in entry.items() if k != "_id"}))
+
 app = FastAPI(title="Sentiment NLP Service", version="1.0.0")
 
 analyzer = SentimentIntensityAnalyzer()
@@ -27,7 +49,7 @@ def get_producer():
     return None
 
 # ─── FETCH REDDIT POSTS ───────────────────────────────
-def fetch_reddit_posts(industry: str, title: str) -> list:
+def fetch_reddit_posts(industry: str, title: str, idea_id: str = None) -> list:
     posts = []
     try:
         headers = {"User-Agent": "StartupValidator/1.0"}
@@ -43,6 +65,7 @@ def fetch_reddit_posts(industry: str, title: str) -> list:
                 if len(text.strip()) > 20:
                     posts.append(text[:500])
     except Exception as e:
+        log_event("sentiment-nlp", "SENTIMENT_FAILED", str(e), level="ERROR", idea_id=idea_id)
         print(f"Reddit fetch error: {e}")
 
     # Fallback sample texts if Reddit fails
@@ -54,11 +77,12 @@ def fetch_reddit_posts(industry: str, title: str) -> list:
             f"This {industry} space needs innovation badly",
             f"Tried many {industry} apps but none solve the real problem"
         ]
+    log_event("sentiment-nlp", "REDDIT_FETCHED", f"Fetched {len(posts)} posts", idea_id=idea_id)
     return posts
 
 # ─── ANALYZE SENTIMENT ────────────────────────────────
-def analyze_sentiment(industry: str, title: str) -> dict:
-    posts   = fetch_reddit_posts(industry, title)
+def analyze_sentiment(industry: str, title: str, idea_id: str = None) -> dict:
+    posts   = fetch_reddit_posts(industry, title, idea_id)
     scores  = []
     results = []
 
@@ -100,6 +124,8 @@ def analyze_sentiment(industry: str, title: str) -> dict:
     negative_scores = [s for s in scores if s < -0.05]
     urgency = min(100, int(len(negative_scores) / len(scores) * 100) + 40)
 
+    log_event("sentiment-nlp", "SENTIMENT_DONE", f"Label: {label}, Score: {sentiment_score}, Urgency: {urgency}", idea_id=idea_id, metadata={"label": label, "score": sentiment_score, "urgency": urgency})
+
     return {
         "sentiment_score":   sentiment_score,
         "sentiment_label":   label,
@@ -138,7 +164,8 @@ def consume_ideas():
         industry = idea.get("industry", "technology")
 
         print(f"Sentiment NLP: processing {idea_id}")
-        sentiment = analyze_sentiment(industry, title)
+        log_event("sentiment-nlp", "PROCESSING_STARTED", f"Analyzing sentiment for: {industry}", idea_id=idea_id)
+        sentiment = analyze_sentiment(industry, title, idea_id)
 
         result = {
             "idea_id":           idea_id,

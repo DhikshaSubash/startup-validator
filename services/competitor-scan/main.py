@@ -5,6 +5,28 @@ from kafka import KafkaConsumer, KafkaProducer
 from bs4 import BeautifulSoup
 import requests, json, os, time, threading
 
+import logging
+from datetime import datetime
+def log_event(service: str, event: str, message: str,
+              idea_id: str = None, level: str = "INFO",
+              metadata: dict = None):
+    entry = {
+        "idea_id":   idea_id,
+        "service":   service,
+        "level":     level,
+        "event":     event,
+        "message":   message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata":  metadata or {}
+    }
+    try:
+        client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://mongo:27017/startup_validator"))
+        client.startup_validator.validation_logs.insert_one(entry)
+    except Exception as e:
+        print(f"Log write failed: {e}")
+    print(json.dumps({k: v for k, v in entry.items() if k != "_id"}))
+
 app = FastAPI(title="Competitor Scan Service", version="1.0.0")
 
 # ─── CORS ───────────────────────────────────────────────
@@ -34,7 +56,7 @@ def get_producer():
     return None
 
 # ─── COMPETITOR SEARCH ────────────────────────────────
-def search_competitors(title: str, industry: str) -> dict:
+def search_competitors(title: str, industry: str, idea_id: str = None) -> dict:
     competitors = []
     saturation_score = 50
 
@@ -57,10 +79,12 @@ def search_competitors(title: str, industry: str) -> dict:
                     })
 
     except Exception as e:
+        log_event("competitor-scan", "SCAN_FAILED", str(e), level="ERROR", idea_id=idea_id)
         print(f"Scrape error: {e}")
 
     # Fallback: generate mock competitors if scraping fails
     if not competitors:
+        log_event("competitor-scan", "FALLBACK_USED", "Product Hunt scrape failed, using mock data", level="WARNING", idea_id=idea_id)
         mock_names = [
             f"{industry.title()}AI",
             f"Smart{title.split()[0].title()}",
@@ -81,6 +105,8 @@ def search_competitors(title: str, industry: str) -> dict:
     else:
         saturation_score = 80
         saturation_level = "high"
+
+    log_event("competitor-scan", "SCAN_COMPLETE", f"Found {count} competitors, saturation: {saturation_level}", idea_id=idea_id, metadata={"count": count, "saturation": saturation_level})
 
     return {
         "competitors": competitors,
@@ -178,7 +204,8 @@ def consume_ideas():
         industry = idea.get("industry", "technology")
 
         print(f"Competitor Scan: processing {idea_id}")
-        result_data = search_competitors(title, industry)
+        log_event("competitor-scan", "PROCESSING_STARTED", f"Scanning competitors for: {title}", idea_id=idea_id)
+        result_data = search_competitors(title, industry, idea_id)
 
         result = {
             "idea_id":          idea_id,

@@ -7,6 +7,27 @@ from kafka import KafkaConsumer, KafkaProducer
 from datetime import datetime
 import json, os, time, threading, uuid, httpx
 
+import logging
+def log_event(service: str, event: str, message: str,
+              idea_id: str = None, level: str = "INFO",
+              metadata: dict = None):
+    entry = {
+        "idea_id":   idea_id,
+        "service":   service,
+        "level":     level,
+        "event":     event,
+        "message":   message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata":  metadata or {}
+    }
+    try:
+        client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://mongo:27017/startup_validator"))
+        client.startup_validator.validation_logs.insert_one(entry)
+    except Exception as e:
+        print(f"Log write failed: {e}")
+    print(json.dumps({k: v for k, v in entry.items() if k != "_id"}))
+
 app = FastAPI(title="Scoring Engine", version="1.0.0")
 
 app.add_middleware(
@@ -258,12 +279,108 @@ def calculate_score(trend: dict, sentiment: dict, competitor: dict) -> dict:
         "swot_threats":       threats,
     }
 
+# ─── AGENTIC AI TOOLS ─────────────────────────────────
+def get_market_trends(keyword: str) -> dict:
+    try:
+        from pytrends.request import TrendReq
+        pytrends = TrendReq(hl='en-US', tz=360)
+        pytrends.build_payload([keyword], timeframe='now 7-d')
+        df = pytrends.interest_over_time()
+        if df.empty:
+            return {"trend_score": 50, "direction": "stable", "keyword": keyword}
+        mean_score = int(df[keyword].mean())
+        direction = "rising" if df[keyword].iloc[-1] >= df[keyword].iloc[0] else "declining"
+        return {"trend_score": mean_score, "direction": direction, "keyword": keyword}
+    except Exception:
+        return {"trend_score": 50, "direction": "stable"}
+
+def search_competitors(query: str) -> dict:
+    try:
+        import httpx
+        from bs4 import BeautifulSoup
+        resp = httpx.get(f"https://www.producthunt.com/search?q={query}", timeout=10.0)
+        if resp.status_code != 200:
+            return {"competitors": [], "count": 0, "saturation": "unknown"}
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        h3s = soup.find_all("h3", limit=5)
+        competitors = [h3.get_text(strip=True) for h3 in h3s if h3.get_text(strip=True)]
+        count = len(competitors)
+        saturation = "high" if count >= 4 else ("medium" if count >= 2 else "low")
+        return {"competitors": competitors, "count": count, "saturation": saturation}
+    except Exception:
+        return {"competitors": [], "count": 0, "saturation": "unknown"}
+
+def analyze_sentiment(topic: str) -> dict:
+    try:
+        import httpx
+        from nltk.sentiment.vader import SentimentIntensityAnalyzer
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        resp = httpx.get(f"https://www.reddit.com/search.json?q={topic}&limit=10", headers=headers, timeout=10.0)
+        if resp.status_code != 200:
+            return {"sentiment": "neutral", "score": 50, "urgency": 50, "posts_analyzed": 0}
+        posts = resp.json().get("data", {}).get("children", [])
+        if not posts:
+             return {"sentiment": "neutral", "score": 50, "urgency": 50, "posts_analyzed": 0}
+        sia = SentimentIntensityAnalyzer()
+        scores = [sia.polarity_scores(p.get("data", {}).get("title", ""))["compound"] for p in posts]
+        avg = sum(scores) / len(scores)
+        score = int((avg + 1) * 50)
+        sentiment = "positive" if score > 60 else ("negative" if score < 40 else "neutral")
+        return {"sentiment": sentiment, "score": score, "urgency": 100 - score, "posts_analyzed": len(posts)}
+    except Exception:
+        return {"sentiment": "neutral", "score": 50, "urgency": 50}
+
+agentic_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_market_trends",
+            "description": "Fetch Google Trends data to get market trends for a keyword.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string"}
+                },
+                "required": ["keyword"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_competitors",
+            "description": "Search competitors for a given query on ProductHunt or the web.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_sentiment",
+            "description": "Analyze sentiment of a topic using Reddit posts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string"}
+                },
+                "required": ["topic"]
+            }
+        }
+    }
+]
+
 # ─── AI ENRICHMENT ────────────────────────────────────
 def enrich_with_ai(idea_title: str, idea_description: str,
-                   industry: str, score_data: dict) -> dict:
+                   industry: str, score_data: dict, idea_id: str = None) -> dict:
     try:
-        api_key = os.getenv("GEMINI_API_KEY")
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        api_key = os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY")
+        model_name = "llama-3.3-70b-versatile"
         # #region agent log
         _debug_log(
             hypothesisId="H1",
@@ -272,34 +389,39 @@ def enrich_with_ai(idea_title: str, idea_description: str,
             data={
                 "api_key_set": bool(api_key),
                 "model_name": model_name,
-                # Avoid logging user content; only log sizes.
                 "idea_title_len": len(idea_title or ""),
                 "idea_description_len": len(idea_description or ""),
             },
         )
         # #endregion
 
-        import google.generativeai as genai
+        import groq
+        import time
+        import json
+        
+        client = groq.Groq(api_key=api_key)
 
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name)
+        prompt = f"""You are a startup validation agent. Use your tools to research this idea if needed. Ensure you evaluate the logic of the idea relative to the heuristic scores provided. 
+CRITICAL SANITY CHECK: If the idea is a parody, intrinsically absurd, illegal, or physically impossible (e.g., physical email delivery bikes, generating gravity with hamsters), you MUST overrule the Initial Validation Score! Set `sanity_check` to false and lower the `adjusted_score` strictly to between 0 and 15! If it is a genuine idea, set `sanity_check` to true and provide an `adjusted_score` that matches or slightly tweaks the Initial Validation Score.
 
-        prompt = f"""You are a startup advisor analyzing a business idea. Based on the data provided, give a detailed analysis.
+Respond with ONLY a raw JSON object — no markdown, no code blocks.
 
 Startup Idea: {idea_title}
 Description: {idea_description}
 Industry: {industry}
-Validation Score: {score_data['final_score']}/100
-Verdict: {score_data['verdict']}
-Market Trend: {score_data['trend_direction']} (score: {score_data['trend_score']}/100)
-Public Sentiment: {score_data['sentiment_label']} (score: {score_data['sentiment_score']}/100)
-Competition Level: {score_data['saturation_level']} (score: {score_data['saturation_score']}/100)
-Problem Urgency: {score_data['problem_urgency']}/100
-Number of Competitors: {score_data['competitor_count']}
-Total Addressable Market: ${score_data['tam_billion']}B
+Initial Validation Score: {score_data.get('final_score')}/100
+Verdict: {score_data.get('verdict')}
+Market Trend: {score_data.get('trend_direction')} (score: {score_data.get('trend_score')}/100)
+Public Sentiment: {score_data.get('sentiment_label')} (score: {score_data.get('sentiment_score')}/100)
+Competition Level: {score_data.get('saturation_level')} (score: {score_data.get('saturation_score')}/100)
+Problem Urgency: {score_data.get('problem_urgency')}/100
+Number of Competitors: {score_data.get('competitor_count')}
+Total Addressable Market: ${score_data.get('tam_billion')}B
 
-Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanation. Just the raw JSON:
+Respond exactly with this JSON:
 {{
+  "adjusted_score": 59,
+  "sanity_check": true,
   "summary": "2-3 sentence executive summary specific to this exact idea and its market position",
   "strengths": ["very specific strength 1 about this idea", "very specific strength 2", "very specific strength 3"],
   "weaknesses": ["very specific weakness 1 about this idea", "very specific weakness 2"],
@@ -314,7 +436,7 @@ Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanati
         _debug_log(
             hypothesisId="H3",
             location="services/scoring-engine/main.py:enrich_with_ai:before_generate",
-            message="about to call Gemini",
+            message="about to call API",
             data={
                 "prompt_chars": len(prompt or ""),
                 "final_score": score_data.get("final_score"),
@@ -323,15 +445,75 @@ Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanati
         )
         # #endregion
 
-        response = model.generate_content(prompt)
-        text     = (getattr(response, "text", "") or "").strip()
-        text     = text.replace("```json", "").replace("```", "").strip()
+        log_event("scoring-engine", "AGENT_STARTED", f"Groq agent initialized for: {idea_title}", idea_id=idea_id)
+        
+        messages = [{"role": "user", "content": prompt}]
+
+        def safe_send_message(msgs, max_retries=3):
+            for attempt in range(max_retries):
+                try:
+                    return client.chat.completions.create(
+                        model=model_name,
+                        messages=msgs,
+                        tools=agentic_tools,
+                        tool_choice="auto"
+                    )
+                except Exception as e:
+                    if attempt < max_retries - 1 and ("429" in str(e).lower() or "rate" in str(e).lower()):
+                        sleep_time = 12 * (attempt + 1)
+                        print(f"Rate limit hit! Sleeping for {sleep_time} seconds (Attempt {attempt+1}/{max_retries})...")
+                        time.sleep(sleep_time)
+                    else:
+                        raise e
+
+        final_text = ""
+        for iteration in range(1, 6):
+            has_tool_call = False
+            response = safe_send_message(messages)
+            response_msg = response.choices[0].message
+            
+            if response_msg.tool_calls:
+                messages.append(response_msg)
+                has_tool_call = True
+                for tc in response_msg.tool_calls:
+                    name = tc.function.name
+                    print(f"Agent calling tool: {name}")
+                    
+                    args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                    log_event("scoring-engine", "TOOL_CALLED", f"Agent called: {name}({args})", idea_id=idea_id, metadata={"tool": name, "args": args})
+                    
+                    if name == "get_market_trends":
+                        tool_result = get_market_trends(**args)
+                    elif name == "search_competitors":
+                        tool_result = search_competitors(**args)
+                    elif name == "analyze_sentiment":
+                        tool_result = analyze_sentiment(**args)
+                    else:
+                        tool_result = {"error": f"Unknown tool: {name}"}
+                        
+                    print(f"Tool result: {tool_result}")
+                    log_event("scoring-engine", "TOOL_RESULT", f"{name} returned: {str(tool_result)}", idea_id=idea_id)
+                    
+                    messages.append({
+                        "tool_call_id": tc.id,
+                        "role": "tool",
+                        "name": name,
+                        "content": json.dumps(tool_result)
+                    })
+            else:
+                final_text = response_msg.content
+                break
+
+        text = final_text
+        if not text:
+            text = "{}"
+        text = text.replace("```json", "").replace("```", "").strip()
 
         # #region agent log
         _debug_log(
             hypothesisId="H4",
             location="services/scoring-engine/main.py:enrich_with_ai:after_generate",
-            message="Gemini response received",
+            message="Gemini agent loop completed",
             data={
                 "response_text_len": len(text or ""),
                 "looks_like_json": "{" in (text or ""),
@@ -339,7 +521,6 @@ Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanati
         )
         # #endregion
 
-        # Try direct JSON parse; if it fails, attempt to extract JSON object
         try:
             result = json.loads(text)
         except Exception:
@@ -347,50 +528,52 @@ Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanati
             match = re.search(r"\{[\s\S]*\}", text)
             if not match:
                 raise ValueError("No JSON object found in model response")
-            candidate = match.group(0)
-            result = json.loads(candidate)
+            result = json.loads(match.group(0))
 
-        # Normalize schema to ensure correct types
-        def ensure_list(x):
+        def ensure_list(x, count):
             if isinstance(x, list):
-                return [str(i).strip() for i in x if str(i).strip()]
+                return [str(i).strip() for i in x if str(i).strip()][:count]
             if x is None:
                 return []
-            return [str(x).strip()]
+            return [str(x).strip()][:count]
 
-        result = {
+        parsed = {
+            "adjusted_score": result.get("adjusted_score"),
+            "sanity_check":   bool(result.get("sanity_check", True)),
             "summary":        str(result.get("summary", "")).strip(),
-            "strengths":      ensure_list(result.get("strengths")),
-            "weaknesses":     ensure_list(result.get("weaknesses")),
-            "opportunities":  ensure_list(result.get("opportunities")),
-            "threats":        ensure_list(result.get("threats")),
+            "strengths":      ensure_list(result.get("strengths"), 3),
+            "weaknesses":     ensure_list(result.get("weaknesses"), 2),
+            "opportunities":  ensure_list(result.get("opportunities"), 3),
+            "threats":        ensure_list(result.get("threats"), 2),
             "recommendation": str(result.get("recommendation", "")).strip(),
             "risk_level":     str(result.get("risk_level", "Medium")).strip().title(),
             "risk_reason":    str(result.get("risk_reason", "")).strip(),
         }
-        if result["risk_level"] not in ["Low", "Medium", "High"]:
-            result["risk_level"] = "Medium"
-        print(f"Gemini AI enrichment successful for: {idea_title}")
+        if parsed["risk_level"] not in ["Low", "Medium", "High"]:
+            parsed["risk_level"] = "Medium"
 
+        print("Agentic AI enrichment successful")
+        log_event("scoring-engine", "AGENT_COMPLETE", f"Agent finished in {iteration} iterations", idea_id=idea_id, metadata={"iterations": iteration})
+        
         # #region agent log
         _debug_log(
             hypothesisId="H4",
             location="services/scoring-engine/main.py:enrich_with_ai:parsed_ok",
             message="Gemini JSON parsed successfully",
             data={
-                "risk_level": result.get("risk_level"),
-                "strengths_count": len(result.get("strengths") or []),
-                "weaknesses_count": len(result.get("weaknesses") or []),
-                "recommendation_len": len(str(result.get("recommendation") or "")),
+                "risk_level": parsed.get("risk_level"),
+                "strengths_count": len(parsed.get("strengths") or []),
+                "weaknesses_count": len(parsed.get("weaknesses") or []),
+                "recommendation_len": len(str(parsed.get("recommendation") or "")),
             },
         )
         # #endregion
-
-        return result
+        
+        return parsed
 
     except Exception as e:
-        print(f"Gemini AI enrichment failed: {e}")
-
+        print(f"Agentic AI enrichment failed: {e}")
+        log_event("scoring-engine", "AGENT_FAILED", str(e), level="ERROR", idea_id=idea_id)
         # #region agent log
         _debug_log(
             hypothesisId="H2_H5",
@@ -402,7 +585,6 @@ Respond with ONLY a valid JSON object. No markdown, no code blocks, no explanati
             },
         )
         # #endregion
-
         return None
 
 # ─── WAIT AND SCORE ───────────────────────────────────
@@ -414,6 +596,7 @@ def wait_and_score(idea_id: str, db, producer, retries=12, delay=5):
 
         if trend and sentiment and competitor:
             print(f"Scoring Engine: all data ready for {idea_id}")
+            log_event("scoring-engine", "DATA_READY", "All 3 services complete, calculating score", idea_id=idea_id)
 
             scored = calculate_score(trend, sentiment, competitor)
 
@@ -424,7 +607,7 @@ def wait_and_score(idea_id: str, db, producer, retries=12, delay=5):
             industry         = trend.get("industry", "technology")
 
             # AI enrichment
-            ai_data = enrich_with_ai(idea_title, idea_description, industry, scored)
+            ai_data = enrich_with_ai(idea_title, idea_description, industry, scored, idea_id)
 
             # #region agent log
             _debug_log(
@@ -440,12 +623,32 @@ def wait_and_score(idea_id: str, db, producer, retries=12, delay=5):
             # #endregion
 
             if ai_data:
+                # OVERRIDE IF AI ADJUSTED IT
+                if ai_data.get("adjusted_score") is not None:
+                    scored["final_score"] = int(ai_data["adjusted_score"])
+                    # Recalculate Verdict explicitly using the same thresholds
+                    if scored["final_score"] >= 75:
+                        scored["verdict"] = "Strong Go"
+                    elif scored["final_score"] >= 55:
+                        scored["verdict"] = "Promising"
+                    elif scored["final_score"] >= 35:
+                        scored["verdict"] = "Needs Work"
+                    else:
+                        scored["verdict"] = "High Risk"
+                        
+                recommendation = ai_data.get("recommendation", "")
+                if not ai_data.get("sanity_check", True):
+                    recommendation = f"[FAIL: ABSURDITY DETECTED - This idea failed logic/sanity checks.] {recommendation}"
+                    
+            log_event("scoring-engine", "SCORE_CALCULATED", f"Score: {scored['final_score']}, Verdict: {scored['verdict']}", idea_id=idea_id, metadata={"score": scored['final_score'], "verdict": scored['verdict']})
+
+            if ai_data:
                 scored["ai_summary"]              = ai_data.get("summary", "")
                 scored["ai_swot_strengths"]       = json.dumps(ai_data.get("strengths", []))
                 scored["ai_swot_weaknesses"]      = json.dumps(ai_data.get("weaknesses", []))
                 scored["ai_swot_opportunities"]   = json.dumps(ai_data.get("opportunities", []))
                 scored["ai_swot_threats"]         = json.dumps(ai_data.get("threats", []))
-                scored["ai_recommendation"]       = ai_data.get("recommendation", "")
+                scored["ai_recommendation"]       = recommendation
                 scored["ai_risk_level"]           = ai_data.get("risk_level", "Medium")
                 scored["ai_risk_reason"]          = ai_data.get("risk_reason", "")
 
@@ -470,8 +673,10 @@ def wait_and_score(idea_id: str, db, producer, retries=12, delay=5):
                         **scored
                     ))
                 session.commit()
+                log_event("scoring-engine", "DB_SAVE_SUCCESS", "Score saved to PostgreSQL", idea_id=idea_id)
             except Exception as e:
                 session.rollback()
+                log_event("scoring-engine", "DB_SAVE_FAILED", str(e), level="ERROR", idea_id=idea_id)
                 print(f"Scoring Engine DB error: {e}")
             finally:
                 session.close()
@@ -493,6 +698,7 @@ def wait_and_score(idea_id: str, db, producer, retries=12, delay=5):
               f"trend={'yes' if trend else 'no'} "
               f"sentiment={'yes' if sentiment else 'no'} "
               f"competitor={'yes' if competitor else 'no'}")
+        log_event("scoring-engine", "WAITING_FOR_DATA", f"trend={'yes' if trend else 'no'} sentiment={'yes' if sentiment else 'no'} competitor={'yes' if competitor else 'no'}", idea_id=idea_id)
         time.sleep(delay)
 
     print(f"Scoring Engine: timeout for {idea_id}")
@@ -522,6 +728,7 @@ def consume_ideas():
     for message in consumer:
         idea    = message.value
         idea_id = idea.get("idea_id")
+        log_event("scoring-engine", "IDEA_RECEIVED", "Scoring pipeline started", idea_id=idea_id)
         print(f"Scoring Engine: received {idea_id}")
         t = threading.Thread(
             target=wait_and_score,
@@ -651,3 +858,11 @@ def get_all_scores(user_email: str = None):
         ]
     finally:
         session.close()
+
+@app.get("/logs/{idea_id}")
+def get_logs(idea_id: str):
+    db = get_mongo()
+    logs = list(db.validation_logs.find({"idea_id": idea_id}).sort("timestamp", 1).limit(100))
+    for log in logs:
+        log.pop("_id", None)
+    return logs

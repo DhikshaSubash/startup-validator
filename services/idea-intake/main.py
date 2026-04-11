@@ -8,6 +8,27 @@ from pymongo import MongoClient
 from datetime import datetime
 import json, os, uuid, time
 
+import logging
+def log_event(service: str, event: str, message: str,
+              idea_id: str = None, level: str = "INFO",
+              metadata: dict = None):
+    entry = {
+        "idea_id":   idea_id,
+        "service":   service,
+        "level":     level,
+        "event":     event,
+        "message":   message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata":  metadata or {}
+    }
+    try:
+        client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://mongo:27017/startup_validator"))
+        client.startup_validator.validation_logs.insert_one(entry)
+    except Exception as e:
+        print(f"Log write failed: {e}")
+    print(json.dumps({k: v for k, v in entry.items() if k != "_id"}))
+
 app = FastAPI(title="Idea Intake Service", version="1.0.0")
 
 app.add_middleware(
@@ -95,6 +116,9 @@ def submit_idea(idea: IdeaInput):
         db.commit()
         db.refresh(new_idea)
 
+        log_event("idea-intake", "IDEA_SUBMITTED", f"Idea received: {new_idea.title} ({new_idea.industry})", idea_id=new_idea.id, metadata={"user_email": new_idea.user_email, "industry": new_idea.industry})
+        log_event("idea-intake", "DB_SAVE_SUCCESS", "Idea saved to PostgreSQL", idea_id=new_idea.id)
+
         # Save to MongoDB for AI enrichment in scoring engine
         mongo = get_mongo()
         mongo.ideas_meta.update_one(
@@ -120,6 +144,7 @@ def submit_idea(idea: IdeaInput):
                 "user_email":  new_idea.user_email
             })
             producer.flush()
+            log_event("idea-intake", "QUEUE_PUBLISHED", "Published to idea-submitted channel", idea_id=new_idea.id)
 
         return {
             "idea_id": new_idea.id,
@@ -127,6 +152,7 @@ def submit_idea(idea: IdeaInput):
         }
     except Exception as e:
         db.rollback()
+        log_event("idea-intake", "DB_SAVE_FAILED", str(e), level="ERROR", idea_id=None)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()

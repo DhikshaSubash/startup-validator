@@ -4,6 +4,30 @@ from kafka import KafkaConsumer, KafkaProducer
 from pytrends.request import TrendReq
 import json, os, time, threading
 
+from pymongo import MongoClient
+import logging
+from datetime import datetime
+
+def log_event(service: str, event: str, message: str,
+              idea_id: str = None, level: str = "INFO",
+              metadata: dict = None):
+    entry = {
+        "idea_id":   idea_id,
+        "service":   service,
+        "level":     level,
+        "event":     event,
+        "message":   message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata":  metadata or {}
+    }
+    try:
+        client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://mongo:27017/startup_validator"))
+        client.startup_validator.validation_logs.insert_one(entry)
+    except Exception as e:
+        print(f"Log write failed: {e}")
+    print(json.dumps({k: v for k, v in entry.items() if k != "_id"}))
+
 app = FastAPI(title="Market Data Service", version="1.0.0")
 
 # ─── MONGODB ──────────────────────────────────────────
@@ -25,7 +49,7 @@ def get_producer():
     return None
 
 # ─── TRENDS FETCH ─────────────────────────────────────
-def fetch_trends(industry: str, title: str) -> dict:
+def fetch_trends(industry: str, title: str, idea_id: str = None) -> dict:
     try:
         pytrends = TrendReq(hl='en-US', tz=330)
         kw = [industry[:50]]
@@ -47,9 +71,11 @@ def fetch_trends(industry: str, title: str) -> dict:
             direction = "stable"
 
         points = [round(x, 1) for x in interest[kw[0]].tail(12).tolist()]
+        log_event("market-data", "TRENDS_FETCHED", f"Score: {avg}, Direction: {direction}", idea_id=idea_id, metadata={"trend_score": avg, "direction": direction})
         return {"trend_score": avg, "trend_direction": direction, "data_points": points}
 
     except Exception as e:
+        log_event("market-data", "TRENDS_FAILED", str(e), level="ERROR", idea_id=idea_id)
         print(f"Trends error: {e}")
         return {"trend_score": 50, "trend_direction": "stable", "data_points": []}
 
@@ -83,7 +109,8 @@ def consume_ideas():
         title    = idea.get("title", "")
 
         print(f"Market Data: processing {idea_id}")
-        trends = fetch_trends(industry, title)
+        log_event("market-data", "PROCESSING_STARTED", f"Analyzing market for: {industry}", idea_id=idea_id)
+        trends = fetch_trends(industry, title, idea_id)
 
         result = {
             "idea_id":         idea_id,
@@ -98,6 +125,7 @@ def consume_ideas():
             {"$set": result},
             upsert=True
         )
+        log_event("market-data", "PROCESSING_COMPLETE", "Market data saved to MongoDB", idea_id=idea_id)
 
         if producer:
             producer.send("market-data-ready", result)

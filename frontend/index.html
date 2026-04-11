@@ -321,12 +321,14 @@ function Sidebar({page,setPage,user,onLogout}){
 function ResultView({score}){
   const [tab,setTab]=useState("overview");
   const [comp,setComp]=useState({loading:false,data:null,error:""});
+  const [logsState,setLogsState]=useState({loading:false,data:[]});
   const tabs=[
     {id:"overview",  label:"Overview"},
     {id:"market",    label:"Market Size"},
     {id:"swot",      label:"SWOT"},
     {id:"breakdown", label:"Score Breakdown"},
     {id:"recommend", label:"Recommendation"},
+    {id:"logs",      label:"Logs"},
     {id:"competitors", label:"Competitors"},
   ];
 
@@ -347,6 +349,31 @@ function ResultView({score}){
       }
     })();
     return()=>{ignore=true;};
+  },[tab,score?.idea_id]);
+
+  useEffect(()=>{
+    if(tab!=="logs"||!score?.idea_id) return;
+    let ignore=false;
+    let timer;
+    const fetchLogs=async()=>{
+      if(!ignore && logsState.data.length===0){
+        setLogsState(s=>({...s, loading:true}));
+      }
+      try{
+        const r=await fetch(`${API_SCORES}/logs/${score.idea_id}`);
+        const d=await r.json();
+        if(!ignore && r.ok){
+          setLogsState({loading:false, data:d||[]});
+        }
+      }catch(e){
+        if(!ignore && logsState.data.length===0) setLogsState(s=>({...s, loading:false}));
+      }
+      if(!ignore){
+        timer = setTimeout(fetchLogs, 3000);
+      }
+    };
+    fetchLogs();
+    return()=>{ignore=true; clearTimeout(timer);};
   },[tab,score?.idea_id]);
 
   return(
@@ -589,6 +616,68 @@ function ResultView({score}){
               `${API_REPORTS}/report/${score.idea_id}`,"_blank")}>
             Download PDF Report
           </button>
+        </div>
+      )}
+
+      {/* Logs */}
+      {tab==="logs"&&(
+        <div>
+          {logsState.loading && logsState.data.length===0 && (
+            <div style={{fontSize:"13px",color:"var(--muted)"}}>Loading logs...</div>
+          )}
+          {!logsState.loading && logsState.data.length===0 && (
+            <div style={{fontSize:"13px",color:"var(--muted)"}}>No logs yet</div>
+          )}
+          {logsState.data.length>0 && (
+            <div style={{display:"flex",flexDirection:"column",gap:"8px"}}>
+              {logsState.data.map((l, i) => {
+                const sBg = {
+                  "idea-intake": "rgba(162, 89, 255, 0.2)",
+                  "market-data": "rgba(20, 184, 166, 0.2)",
+                  "competitor-scan": "rgba(59, 130, 246, 0.2)",
+                  "sentiment-nlp": "rgba(245, 158, 11, 0.2)",
+                  "scoring-engine": "rgba(16, 185, 129, 0.2)",
+                  "report-gen": "rgba(244, 63, 94, 0.2)",
+                  "api-gateway": "rgba(100, 116, 139, 0.2)"
+                };
+                const sCol = {
+                  "idea-intake": "#a259ff",
+                  "market-data": "#14b8a6",
+                  "competitor-scan": "#3b82f6",
+                  "sentiment-nlp": "#f59e0b",
+                  "scoring-engine": "#10b981",
+                  "report-gen": "#f43f5e",
+                  "api-gateway": "#64748b"
+                };
+                const time = l.timestamp ? new Date(l.timestamp).toLocaleTimeString([], {hour12:false}) : "";
+                
+                let bLeft = "none";
+                if(l.level==="ERROR") bLeft="3px solid var(--red)";
+                else if(l.level==="WARNING") bLeft="3px solid var(--amber)";
+                
+                return (
+                  <div key={i} style={{
+                    background:"var(--bg)", border:"1px solid var(--border)",
+                    borderRadius:"8px", padding:"12px", borderLeft: bLeft !== "none" ? bLeft : `1px solid var(--border)`
+                  }}>
+                    <div style={{display:"flex",alignItems:"center",gap:"12px",marginBottom:"6px"}}>
+                      <span style={{fontSize:"11px",color:"var(--muted)"}}>{time}</span>
+                      <span className="badge" style={{
+                        background: sBg[l.service] || "var(--border)",
+                        color: sCol[l.service] || "#fff"
+                      }}>
+                        {l.service}
+                      </span>
+                      <span style={{fontSize:"12px",fontWeight:"700",color:"var(--purple)"}}>{l.event}</span>
+                    </div>
+                    <div style={{fontSize:"13px",color:"#cbd5e1"}}>
+                      {l.message}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 

@@ -13,6 +13,27 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT
 from datetime import datetime
 import json, os, time, threading, uuid
 
+import logging
+def log_event(service: str, event: str, message: str,
+              idea_id: str = None, level: str = "INFO",
+              metadata: dict = None):
+    entry = {
+        "idea_id":   idea_id,
+        "service":   service,
+        "level":     level,
+        "event":     event,
+        "message":   message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata":  metadata or {}
+    }
+    try:
+        client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://mongo:27017/startup_validator"))
+        client.startup_validator.validation_logs.insert_one(entry)
+    except Exception as e:
+        print(f"Log write failed: {e}")
+    print(json.dumps({k: v for k, v in entry.items() if k != "_id"}))
+
 app = FastAPI(title="Report Generation Service", version="1.0.0")
 
 from fastapi.middleware.cors import CORSMiddleware
@@ -187,6 +208,7 @@ def generate_pdf(idea_id: str, score_data: dict) -> str:
     ))
 
     doc.build(story)
+    log_event("report-gen", "PDF_GENERATED", f"Report saved: {file_path}", idea_id=idea_id, metadata={"file_path": file_path})
     print(f"Report Gen: PDF created at {file_path}")
     return file_path
 
@@ -214,6 +236,8 @@ def consume_scores():
     for message in consumer:
         score_data = message.value
         idea_id    = score_data.get("idea_id")
+        score = score_data.get("final_score")
+        log_event("report-gen", "REPORT_STARTED", f"Generating PDF for score: {score}", idea_id=idea_id)
         print(f"Report Gen: generating report for {idea_id}")
 
         try:
@@ -228,6 +252,7 @@ def consume_scores():
                 session.close()
             print(f"Report Gen: done for {idea_id}")
         except Exception as e:
+            log_event("report-gen", "PDF_FAILED", str(e), level="ERROR", idea_id=idea_id)
             print(f"Report Gen: error for {idea_id}: {e}")
 
 @app.on_event("startup")

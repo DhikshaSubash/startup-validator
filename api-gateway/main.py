@@ -7,6 +7,30 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 import os, json, warnings
 
+from pymongo import MongoClient
+from datetime import datetime
+import logging
+
+def log_event(service: str, event: str, message: str,
+              idea_id: str = None, level: str = "INFO",
+              metadata: dict = None):
+    entry = {
+        "idea_id":   idea_id,
+        "service":   service,
+        "level":     level,
+        "event":     event,
+        "message":   message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "metadata":  metadata or {}
+    }
+    try:
+        client = MongoClient(
+            os.getenv("MONGO_URI", "mongodb://mongo:27017/startup_validator"))
+        client.startup_validator.validation_logs.insert_one(entry)
+    except Exception as e:
+        print(f"Log write failed: {e}")
+    print(json.dumps({k: v for k, v in entry.items() if k != "_id"}))
+
 warnings.filterwarnings("ignore", ".*error reading bcrypt version.*")
 
 app = FastAPI(title="Startup Validator - API Gateway", version="1.0.0")
@@ -111,6 +135,7 @@ def register(user: UserRegister):
     }
     save_users(users)
     token = create_token({"sub": email, "name": user.name})
+    log_event("api-gateway", "USER_REGISTERED", f"New user registered: {email}")
     return {
         "token":   token,
         "name":    user.name,
@@ -124,8 +149,10 @@ def login(user: UserLogin):
     users  = load_users()
     stored = users.get(email)
     if not stored or not pwd_context.verify(user.password, stored["password"]):
+        log_event("api-gateway", "USER_LOGIN_FAILED", f"Failed login for: {email} — Invalid credentials", level="WARNING")
         raise HTTPException(status_code=401, detail="Invalid email or password")
     token = create_token({"sub": email, "name": stored["name"]})
+    log_event("api-gateway", "USER_LOGIN_SUCCESS", f"User logged in: {email}")
     return {
         "token":   token,
         "name":    stored["name"],
